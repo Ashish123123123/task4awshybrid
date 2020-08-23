@@ -1,0 +1,384 @@
+Objective of the task 4 :
+Statement : We have to create a web portal for our company with all the security as much as possible. So we use wordpress software with dedicated database server.Database should not be accessible from the outside world for security purpose.We only need to public the wordpress to clients.
+1. Write a Infrastructure as code using terraform , which automatically create a vpc.
+2. In that VPC we have to create 2 subnets:
+   a) public subnet [accessible for public world]
+   b) private subnet [Restricted for public world]
+3. Create a public facing internet gateway for connect our vpc/ network to the internet world and attach this gateway to our vpc.
+4. Create a routing table for internet gateway so that instance can connect to outside world, update and associate it with public subnet.
+5. Launch an ec2 instance which has wordpress setup already having the security group allowing port 80 so that our client can connect ot our wordpress site.
+   also attach the key to further login into it
+6. Launch an ec2 instance which has MYSQL setup already with security group allowing port 3306 in private subnet so that our wordpress vm can connect with the same
+Note :
+•	Wordpress instance has to be part of public subnet so that our client can connect our site.
+•	mysql instance has to be part of private subnet so that outside world can't connect to it.
+•	don't forget to add auto IP assign and auto DNS name assignment option to be enabled
+•	The above task should have an additional feature to be added that is NAT gateway to provide the internet access to instance running in the private subnet.
+Prerequisites : 
+•	Account in aws
+•	Instance AMI of preconfigured mysql and web server, that we need to deploy
+•	Terraform
+•	Aws cli
+•	Vs code (optional)
+Some important terms : 
+VPC - Amazon Virtual Private Cloud (Amazon VPC) lets you provision a logically isolated section of the AWS Cloud where you can launch AWS resources in a virtual network that you define. ... You can use both IPv4 and IPv6 in your VPC for secure and easy access to resources and applications.
+Subnet - Subnetwork or subnet is a logical subdivision of an IP network. The practice of dividing a network into two or more networks is called subnetting. It's a part of vpc.
+Public subnet - AWS provides two types of subnetting one is Public which allow the internet to access the machine , i.e have access to the internet and anyone can access it from internet.
+Private subnet - Subnet which is hidden from the internet , and no outside user can access it's resources is called private subnet.
+Internet gateway - is a horizontally scaled, redundant, and highly available VPC component that allows communication between instances in your VPC and the internet. An internet gateway serves two purposes: to provide a target in your VPC route tables for internet-routable traffic and to perform network address translation (NAT) for instances that have been assigned public IPv4 addresses.
+NAT gateway - nat gateway gives cloud resources without public IP addresses access to the internet without exposing those resources to incoming internet connections.
+Task Overview :
+ 
+
+Here we will have our database server in private subnet and other accessible machines in public subnet. all the webserver can access only database service of the database server. No one can ssh it. In case if need to ssh the server we have an other machine named as Bastion.
+Steps
+Initial steps of creating IAM user and aws cli configuration of user profile in cmd prompt is same as task 1 and task 2 , rest is discussed below:
+Step 1 : Create project directory and create terraform files.
+for this make a directory for project ,here in our case it is named as task 4 dir
+Here i am creating three different terraform files for ease of handling, there names are :
+1.	vpc.tf for writing vpc code.
+2.	webserver.tf - for public subnet code.
+3.	database_server.tf - for private subnet code.
+Step 2 : Insert provider information and code to generate a key pair .
+File = vpc.tf
+provider "aws" {
+  region     = "us-east-2"
+  profile    = "vpc-task"
+}
+
+
+variable "key_name" {}
+
+resource "tls_private_key" "example" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+
+resource "aws_key_pair" "generated_key" {
+  key_name   = "${var.key_name}"
+  public_key = "${tls_private_key.example.public_key_openssh}"
+}
+
+
+variable "public_key"{
+    default = "aws_key_pair.generated_key.key_name"
+}
+
+resource "local_file"  "private_key"{
+ content = tls_private_key.example.private_key_pem
+ filename = "${var.key_name}.pem"
+
+depends_on = [
+    tls_private_key.example,
+    aws_key_pair.generated_key    
+]
+}
+Step 3 : Create your own vpc.
+Here we are creating our vpc for this we need to define the cidr block or simply the range of network we want to use in our vpc, i'm using 192.168.0.0/16
+resource "aws_vpc" "task3-vpc" {
+  cidr_block       = "192.168.0.0/16"
+  instance_tenancy = "default"
+  enable_dns_hostnames  = true
+
+  tags = {
+    Name = "task2-vpc"
+  }
+}
+
+Step 4 : Create subnet under vpc.
+We will create two subnets, public and private, initially we are just creating two subnet, structure of both is same, there behaviour depends upon the route table and other firewalls.
+resource "aws_subnet" "public-subnet" {
+  vpc_id     = "${aws_vpc.task3-vpc.id}"
+  cidr_block = "192.168.10.0/24"
+
+  tags = {
+    Name = "public-subnet"
+  }
+}
+
+resource "aws_subnet" "private-subnet" {
+  vpc_id     = "${aws_vpc.task3-vpc.id}"
+  cidr_block = "192.168.20.0/24"
+
+  tags = {
+    Name = "private-subnet"
+  }
+}
+
+Step 5 : Create one internet gateway for public subnet.
+resource "aws_internet_gateway" "public-subnet-igw" {
+    vpc_id = "${aws_vpc.task3-vpc.id}"
+    tags = {
+        Name = "public-subnet-igw"
+    }
+}
+
+Step 6 : Create route table for public subnet and associate it with public sunet
+I'm creating a route table and creating a route that " if any of the instance desire to go anywhere redirect it's request to the internet gateway" . And associating this route table with public subnet, so that it can use IG.
+resource "aws_route_table" "public-route" {
+  vpc_id = "${aws_vpc.task3-vpc.id}"
+
+  route {
+     cidr_block = "0.0.0.0/0"
+    gateway_id = "${aws_internet_gateway.public-subnet-igw.id}"
+  }
+
+  tags = {
+    Name = "public-route-table"
+  }
+}
+
+resource "aws_route_table_association" "public-subnet-association" {
+  subnet_id      = aws_subnet.public-subnet.id
+  route_table_id = aws_route_table.public-route.id
+}
+
+
+Step 7 : Launch NAT instance
+Here we need a NAT gateway to allow the private instances to go out of the the vpc . But instead of using nat gateway , we can use a nat instance as a gateway to internet world.
+Note : NAT instance must be launched in public subnet.
+resource "aws_instance" "nat-instance" {
+
+        depends_on = [
+    aws_security_group.public-sg,
+  ]
+ 
+    ami = "ami-00d1f8201864cc10c"
+    instance_type = "t2.micro"
+    key_name    = "${var.key_name}"
+     vpc_security_group_ids = ["${aws_security_group.public-sg.id}"]
+      subnet_id = "${aws_subnet.public-subnet.id}"
+    associate_public_ip_address = true
+    source_dest_check = false
+
+    tags = {
+        Name = "VPC NAT INSTANCE"
+    }
+}
+Step 8 : Create a route table for private instance and associate it with private subnet.
+Here we will write a rule that if there is any request to go outside, redirect it to the nat instance.
+File = webserver.tf
+Step 7 : Create a security group for instances launched under public subnet .
+This security group will allow request at port number 80, 443 and 22 from anywhere.
+resource "aws_security_group" "public-sg" {
+    name = "public-sg"
+    description = "Allow connection to public instances connections."
+
+    ingress {
+        from_port = 80
+        to_port = 80
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+    ingress {
+        from_port = 443
+        to_port = 443
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+    ingress {
+        from_port = 22
+        to_port = 22
+        protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+    ingress {
+        from_port = -1
+        to_port = -1
+        protocol = "icmp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+      egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }  
+
+    vpc_id = "${aws_vpc.task3-vpc.id}"
+
+    tags = {
+        Name = "public-sg"
+    }
+}
+Step 8 : Launch webserver in public subnet .
+Here we have an AMI image, in which wordpress is already configured, just we need is to provide the id or our own created ami.
+resource "aws_instance" "webserver" {
+
+           depends_on = [
+    aws_security_group.public-sg,
+  ]
+ 
+    ami = "ami-0a54aef4ef3b5f881"
+    instance_type = "t2.micro"
+    key_name    = "${var.key_name}"
+      vpc_security_group_ids = ["${aws_security_group.public-sg.id}"]
+    subnet_id = "${aws_subnet.public-subnet.id}"
+    associate_public_ip_address = true
+
+
+    tags = {
+        Name = "Web Server"
+    }
+}
+Step 9 : Copy the private key in webserver, so that we can access bastion and mysql server .
+resource "null_resource" "copying_key" {
+
+  provisioner "local-exec"   {
+    command = "echo scp -i ${var.key_name}.pem   ${var.key_name}.pem   ec2-user@${aws_instance.webserver.public_ip}:~/"
+  }
+}
+
+Step 10 : Create one more security group for BASTION .
+As mentioned in our objective, we need a special machine that can access and enter inside the private subnet instances, for this we are creating one new security group, machines who belongs to this group will be allowed only to access private subnet machines. Moreover this BASTION machines can be accessed only from public subnet, not outside the vpc.
+resource "aws_security_group" "bastion-sg" {
+    name = "bastion-sg"
+    description = "Allow incoming traffic from bastion ."
+
+    ingress {
+        from_port = 22
+        to_port = 22
+        protocol = "tcp"
+        cidr_blocks = ["192.168.0.0/16"]
+    }
+    ingress {
+        from_port = -1
+        to_port = -1
+        protocol = "icmp"
+        cidr_blocks = ["192.168.0.0/16"]
+    }
+
+     egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["192.168.0.0/16"]
+  }  
+
+    vpc_id = "${aws_vpc.task3-vpc.id}"
+    tags = {
+        Name = "bastion-sg"
+    }
+}
+
+
+Step 11 : Launch BASTION in public subnet .
+resource "aws_instance" "bastion" {
+        depends_on = [
+    aws_security_group.bastion-sg,
+  ]
+    ami = "ami-0345bb602caf0acf1"
+    instance_type = "t2.micro"
+    key_name    = "${var.key_name}"
+   vpc_security_group_ids = ["${aws_security_group.bastion-sg.id}"]
+    subnet_id = "${aws_subnet.public-subnet.id}"
+    tags = {
+        Name = "Bastion"
+    }
+}
+
+File = database_server.tf
+Step 12 : Create a security group for private subnet instances.
+Private security group will allow only port 1433 and 3306 from public security group instances and allow ssh (port = 22) only to members of sg bastion-sg.
+resource "aws_security_group" "private-sg" {
+    name = "private-sg"
+    description = "Allow incoming database connections."
+
+    ingress { # SQL Server
+        from_port = 1433
+        to_port = 1433
+        protocol = "tcp"
+        security_groups = ["${aws_security_group.public-sg.id}"]
+    }
+    ingress { # MySQL
+        from_port = 3306
+        to_port = 3306
+        protocol = "tcp"
+        security_groups = ["${aws_security_group.public-sg.id}"]
+    }
+
+    ingress {
+        from_port = 22
+        to_port = 22
+        protocol = "tcp"
+        security_groups = ["${aws_security_group.bastion-sg.id}"]
+    }
+    ingress {
+        from_port = -1
+        to_port = -1
+        protocol = "icmp"
+        cidr_blocks = ["192.168.0.0/16"]
+    }
+
+     egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["192.168.0.0/16"]
+  }  
+
+  vpc_id = "${aws_vpc.task3-vpc.id}"
+
+    tags = {
+        Name = "private-sg"
+    }
+}
+
+Step 13 : Launch dbserver in private subnet.
+resource "aws_instance" "db-server" {
+        depends_on = [
+    aws_security_group.bastion-sg,
+    aws_security_group.private-sg,
+  ]
+    ami = "ami-01e8b5dc708d8551c"
+    instance_type = "t2.micro"
+    key_name    = "${var.key_name}"
+      vpc_security_group_ids = ["${aws_security_group.private-sg.id}"]
+    subnet_id = "${aws_subnet.private-subnet.id}"
+
+
+    tags = {
+        Name = "DB Server "
+    }
+}
+
+------------------------------- Coding section completed -----------------------------------------------
+Deployment -
+•	Initialize the terraform and validate the code after than apply
+terraform init
+terraform validate
+•	Apply the code, to launch the infrastructure , use cmd
+terraform apply
+enter the key name as i'm entering task3-key , and enter yes for confirmation
+ 
+•	Our infrastructure is launched and now let's check all the things;
+•	Go to aws console and check for vpc : here is our vpc -
+ 
+•	Check the subnets : here is our two subnets created with same name as entered in the code.
+ 
+•	Check Internet Gateway : see it's created ....
+ 
+•	Check for route table:
+ 
+•	Checking for instance - four instances has been launched by terraform. they are webserver, Bastion and Nat instance in public subnet & dbserver in private subnet.
+
+ 
+•	Checking for wordpress site. use the public ip of the webserver and browse to see
+ 
+Well going, now let's check whether we are able to ssh the public subnet machines , note that the ntw in public subnet is 192.168.10.0/16
+our webserver ip is - 192.168.10.55, and we ssh it and ls to see whether our key is there or not. As it is in public network so we can ssh it.
+
+ 
+yes it's there with name task4-key.pem
+•	Now from webser i.e 192.138.10.55 ping the dbserver - it will ping , but when try to ssh , it won't allow , because security group blocks the entry.
+•	Now ssh to bastion and try to ssh the dbserver, note that bastion here is in public subnet and ip is 192.168.10.24 and ip of dbserver is 192.168.20.65
+
+ 
+Note : There comes an error when we use copied key to ssh "bad permission" , to solve it use the cmd - sudo chmod 600 key_name.pem
+•	Our private instances can also go to outside world using the nat instances. 
+Everything is working fine, and that's it.
+•	To destroy the complete setup use the command - 
+terraform destroy --auto-approve
+
